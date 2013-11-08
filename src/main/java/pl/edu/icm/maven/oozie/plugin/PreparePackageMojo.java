@@ -1,32 +1,44 @@
 package pl.edu.icm.maven.oozie.plugin;
 
-import static org.twdata.maven.mojoexecutor.MojoExecutor.artifactId;
-import static org.twdata.maven.mojoexecutor.MojoExecutor.configuration;
-import static org.twdata.maven.mojoexecutor.MojoExecutor.element;
-import static org.twdata.maven.mojoexecutor.MojoExecutor.executeMojo;
-import static org.twdata.maven.mojoexecutor.MojoExecutor.goal;
-import static org.twdata.maven.mojoexecutor.MojoExecutor.groupId;
-import static org.twdata.maven.mojoexecutor.MojoExecutor.name;
-import static org.twdata.maven.mojoexecutor.MojoExecutor.plugin;
-import static org.twdata.maven.mojoexecutor.MojoExecutor.version;
-
-import java.io.File;
-
+import com.google.common.io.Files;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.plugin.MojoExecutionException;
+import org.apache.maven.plugins.annotations.Component;
 import org.apache.maven.plugins.annotations.Mojo;
+import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.plugins.annotations.ResolutionScope;
-import org.apache.maven.shared.dependency.tree.DependencyNode;
 import org.apache.maven.shared.dependency.tree.DependencyTreeBuilderException;
-
+import org.sonatype.aether.RepositorySystem;
+import org.sonatype.aether.RepositorySystemSession;
+import org.sonatype.aether.collection.DependencySelector;
+import org.sonatype.aether.graph.DependencyNode;
+import org.sonatype.aether.graph.Exclusion;
+import org.sonatype.aether.repository.RemoteRepository;
+import org.sonatype.aether.util.artifact.DefaultArtifact;
+import org.sonatype.aether.util.graph.selector.AndDependencySelector;
+import org.sonatype.aether.util.graph.selector.ExclusionDependencySelector;
+import org.sonatype.aether.util.graph.selector.ScopeDependencySelector;
 import pl.edu.icm.maven.oozie.plugin.pigscripts.ConfigurationReader;
 import pl.edu.icm.maven.oozie.plugin.pigscripts.PigScriptExtractor;
 
-import com.google.common.io.Files;
+import java.io.File;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+
+import static org.twdata.maven.mojoexecutor.MojoExecutor.*;
 
 @Mojo(name = "prepare-package", requiresDependencyResolution = ResolutionScope.COMPILE)
 public class PreparePackageMojo extends AbstractOozieMojo {
-	
+    @Component
+    private RepositorySystem repoSystem;
+
+    @Parameter(defaultValue = "${repositorySystemSession}")
+    private RepositorySystemSession repoSession;
+
+    @Parameter(defaultValue = "${project.remoteProjectRepositories}")
+    private List<RemoteRepository> remoteRepos;
+
 	PigScriptExtractor  psh = null;
 	
     @Override
@@ -45,13 +57,17 @@ public class PreparePackageMojo extends AbstractOozieMojo {
             return;
         }
 
-        DependencyNode dependencyTree;
+        org.apache.maven.shared.dependency.tree.DependencyNode dependencyTree;
         try {
             dependencyTree = dependencyTreeBuilder.buildDependencyTree(mavenProject, localRepository, null);
         } catch (DependencyTreeBuilderException ex) {
             throw new MojoExecutionException("Failed to build dependency tree", ex);
         }
-        unpackWorkflows("${project.build.directory}/" + OoziePluginConstants.OOZIE_WF_PREPARE_PACKAGE_DIR, dependencyTree);
+
+        unpackWorkflows(
+                new File("${project.build.directory}", OoziePluginConstants.OOZIE_WF_PREPARE_PACKAGE_DIR),
+                new File("${project.build.directory}", "dependency-maven-plugin-markers"),
+                mavenProject.getArtifact());
 
         /*
          * This step can be omitted when the following problem with "exclude"
@@ -120,32 +136,33 @@ public class PreparePackageMojo extends AbstractOozieMojo {
                 element("filtering", String.valueOf(filtering))))), environment);
     }
 
-    private void unpackWorkflows(String outputDirectory, DependencyNode dependencyTree) throws MojoExecutionException {
+    private void unpackWorkflows(File outputDirectory, File markersDirectory, Artifact af) throws MojoExecutionException {
+        FullWorkflowDependencyTreeBuilder treeBuilder =
+                new FullWorkflowDependencyTreeBuilder(repoSystem, repoSession, remoteRepos, getLog());
 
-        for (DependencyNode childNode : dependencyTree.getChildren()) {
-            Artifact af = childNode.getArtifact();
-            if (OoziePluginConstants.OOZIE_WF_CLASSIFIER.equals(af.getClassifier())) {
+        org.sonatype.aether.artifact.Artifact aetherArtifact =
+                new DefaultArtifact(af.getGroupId(), af.getArtifactId(), af.getClassifier(), af.getType(), af.getVersion());
 
-                executeMojo(
-                        plugin(groupId("org.apache.maven.plugins"),
-                        artifactId("maven-dependency-plugin"),
-                        version(OoziePluginConstants.MAVEN_DEPENDENCY_PLUGIN_VERSION)),
-                        goal("unpack-dependencies"),
-                        configuration(
-                        element(name("outputDirectory"), outputDirectory),
-                        element(name("includeGroupIds"), af.getGroupId()),
-                        element(name("includeArtifactIds"), af.getArtifactId())),
-                        environment);
+        DependencySelector scopeSelector = new ScopeDependencySelector(Arrays.asList("compile", "runtime"), null);
+        DependencySelector workflowSelector = new NotDependencySelector(new ExclusionDependencySelector(
+                Collections.singleton(new Exclusion("*", "*", OoziePluginConstants.OOZIE_WF_CLASSIFIER, "tar.gz"))));
 
-                unpackWorkflows(outputDirectory + "/" + af.getGroupId() + "-" + af.getArtifactId(), childNode);
-            }
+        DependencySelector uberSelector = new AndDependencySelector(scopeSelector, workflowSelector);
+
+        DependencyNode root = treeBuilder.buildDependencyTree(aetherArtifact, uberSelector);
+
+        for(DependencyNode node: root.getChildren()) {
+            UnpackingDependencyVisitor visitor =
+                    new UnpackingDependencyVisitor(outputDirectory,  markersDirectory, environment);
+            node.accept(visitor);
+            visitor.throwIfFailed();
         }
     }
 
-    private void unpackPigScripts(String globalLibDirectory, String currentTreePosition, DependencyNode dependencyTree, File tmpDir)
+    private void unpackPigScripts(String globalLibDirectory, String currentTreePosition, org.apache.maven.shared.dependency.tree.DependencyNode dependencyTree, File tmpDir)
             throws MojoExecutionException {
 
-        for (DependencyNode childNode : dependencyTree.getChildren()) {
+        for (org.apache.maven.shared.dependency.tree.DependencyNode childNode : dependencyTree.getChildren()) {
             Artifact af = childNode.getArtifact();
 
             if ("jar".equals(af.getType()) && !Artifact.SCOPE_TEST.equals(af.getScope())) {
